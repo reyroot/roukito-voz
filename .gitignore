@@ -1,0 +1,9 @@
+__pycache__/
+*.apk
+cert.pem
+key.pem
+android/local.properties
+android/.gradle/
+android/app/build/
+android/build/
+.venv/

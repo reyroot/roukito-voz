@@ -1,0 +1,21 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "com.roukito.voz"
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.roukito.voz"
+        minSdk 26
+        targetSdk 34
+        versionCode 6
+        versionName "1.5"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

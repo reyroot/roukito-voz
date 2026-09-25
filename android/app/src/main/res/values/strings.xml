@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Ver en la tele</string>
+    <string name="talk">Hablar con la tele. Pulsa dos veces para decir qué quieres hacer.</string>
+    <string name="listening">Escuchando</string>
+</resources>

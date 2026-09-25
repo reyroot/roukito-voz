@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:keepScreenOn="true">
+
+    <Button
+        android:id="@+id/talk"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#00BB55"
+        android:contentDescription="@string/talk"
+        android:text="Hablar"
+        android:textColor="#FFFFFF"
+        android:textSize="48sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:importantForAccessibility="no"
+        android:padding="16dp"
+        android:textColor="#FFFFFF"
+        android:textSize="18sp" />
+</FrameLayout>
