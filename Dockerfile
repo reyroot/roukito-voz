@@ -4,7 +4,7 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir yt-dlp
 
-COPY server.py .
+COPY server.py understand.py ./
 
 EXPOSE 8790
 

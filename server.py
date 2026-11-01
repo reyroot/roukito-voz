@@ -6,10 +6,14 @@ import os
 import re
 import socket
 import subprocess
+import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+from understand import understand
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("ROUKITO_VOZ_DATA", ROOT))
@@ -43,6 +47,10 @@ ONES = {
     "cuarta": 4,
     "5": 5,
     "cinco": 5,
+    # How the recognizer sometimes writes "cinco" and "tres".
+    "sinco": 5,
+    "zinco": 5,
+    "trece": 3,
     "quinto": 5,
     "quinta": 5,
 }
@@ -52,14 +60,15 @@ MAX_RESULTS = 5
 CANCEL = {"cancela", "cancelar", "nada", "para", "parar", "salir"}
 YES = {"si", "sí", "yes", "claro", "bueno", "ok", "okay", "dale", "busca", "buscar", "correcto", "exacto", "bien", "adelante"}
 NO = {"no", "nel", "nop", "cambiar", "cambia", "otro", "otra"}
-REPEAT = {"repite", "repetir", "otra", "otravez", "denuevo"}
+REPEAT = {"repite", "repitelo", "repítelo", "repetir", "otra", "otravez", "denuevo"}
 FILLER = {
     "quiero", "queria", "quería", "ver", "video", "videos", "por", "favor",
     "porfavor", "ponme", "pon", "pone", "busca", "buscar", "el", "la", "los", "las",
     "un", "una", "me", "mi", "mis", "porfa", "porfis", "anda", "reproducir",
     "poner", "de", "del", "al", "a", "y", "en", "que", "qué", "lo", "le", "les",
     "te", "se", "con", "para", "oye", "oiga", "hola", "gracias", "quieres",
-    "puedes", "puede", "please",
+    "puedes", "puede", "please", "youtube", "gusta", "gustan", "ninguno", "ninguna",
+    "mejor", "algo",
 }
 LIST_WORDS = {"lista", "ultima", "último", "última", "anterior", "guardada", "guardado"}
 LIST_COMMAND = FILLER | LIST_WORDS | {
@@ -298,6 +307,8 @@ def pick_by_title(heard: str, videos: list[dict]) -> int:
         if score > best_score:
             best_score = score
             best_index = index
+        elif score == best_score:
+            best_index = 0  # two videos match as well, so it is not clear which one
     return best_index if best_score else 0
 
 
@@ -410,96 +421,212 @@ def use_saved_list(session: dict, heard: str) -> dict:
     return {"say": list_phrase(videos), "phase": "choice", "videos": videos}
 
 
-def turn(session_id: str, text: str, client_phase: str = "") -> dict:
-    session = sessions.setdefault(session_id, {"phase": "menu", "videos": [], "query": ""})
-    if client_phase == "menu":
-        session["phase"] = "menu"
-        session["videos"] = []
-        session["query"] = ""
-    heard = (text or "").strip()
-    lowered = re.sub(r"[^a-záéíóúüñ0-9 ]", "", heard.lower())
-    tokens = set(lowered.split())
+# Words that carry no topic of their own. An answer made only of these is
+# understood by the rules below without asking the model.
+COMMAND_WORDS = (
+    FILLER | LIST_COMMAND | set(ONES) | STOP_WORDS | PLAY_WORDS | SEARCH_WORDS
+    | YES | NO | REPEAT | CANCEL
+    | {"tele", "television", "televisión", "tv", "eso", "ese", "esa", "este", "esta", "mismo", "ya", "ahora"}
+)
+MENU_ACTIONS = (None, "buscar", "detener", "reproducir", "lista_guardada")
+LAST_WORDS = {"ultimo", "ultima"}
+# In the list, these mean "none of these, look for something else".
+OTHER_SEARCH = {"busca", "buscar", "ninguno", "ninguna", "otro", "otra", "otros", "otras"}
 
-    words = lowered.split()
+
+def only_commands(words: list[str]) -> bool:
+    known = folded_tokens(COMMAND_WORDS)
+    return all(fold_word(word) in known for word in words)
+
+
+def wants_repeat(words: list[str]) -> bool:
+    compact = "".join(words)
+    return bool(set(words) & REPEAT) or "otravez" in compact or "denuevo" in compact
+
+
+def intent(action: str, topic: str = "", number: int = 0) -> dict:
+    return {"accion": action, "tema": topic, "numero": number}
+
+
+def rule_intent(phase: str, words: list[str], heard: str, videos: list[dict]) -> dict | None:
+    """Short, unambiguous answers: a number, sí, no, para, repite. None means ask the model."""
+    if phase == "menu" and only_commands(words):
+        picked = menu_choice(words, set(words))
+        if picked:
+            return intent(MENU_ACTIONS[picked])
+    if phase == "confirm":
+        kind = answer_kind(words)
+        if kind == "yes" and "no" not in words:
+            return intent("si")
+        if kind == "no" and only_commands(words):
+            return intent("no")
+    if phase == "choice":
+        if wants_repeat(words):
+            return intent("repetir")
+        number = choice_number(heard)
+        if number and only_commands(words):
+            return intent("elegir", number=number)
+        if folded_tokens(words) & LAST_WORDS and only_commands(words):
+            return intent("elegir", number=len(videos))
+        if not set(words) & OTHER_SEARCH:
+            # "el de Luisito Comunica": words from one title or channel.
+            picked = pick_by_title(heard, videos)
+            if picked:
+                return intent("elegir", number=picked)
+    return None
+
+
+def fallback_intent(phase: str, words: list[str], heard: str, videos: list[dict]) -> dict:
+    """What the word rules make of the answer when the model is unavailable or unsure."""
+    if phase == "menu":
+        picked = menu_choice(words, set(words))
+        if picked == 1:
+            return intent("buscar", menu_topic(heard))
+        return intent(MENU_ACTIONS[picked]) if picked else intent("no_entendi")
+    if phase == "confirm":
+        kind = answer_kind(words)
+        if kind == "no":
+            rest = re.sub(r"^\W*\w+", "", heard, count=1)
+            return intent("buscar", search_term(rest)) if content_words(rest) else intent("no")
+        return intent("si") if kind == "yes" else intent("no_entendi")
+    if phase == "choice":
+        if set(words) & OTHER_SEARCH:
+            topic = " ".join(word for word in content_words(heard) if word not in OTHER_SEARCH)
+            return intent("buscar", topic) if topic else intent("no_entendi")
+        number = choice_number(heard)
+        return intent("elegir", number=number) if number and number <= len(videos) else intent("no_entendi")
+    return intent("buscar", search_term(heard))
+
+
+def clean_topic(topic: str) -> str:
+    topic = re.sub(r"\s+", " ", topic).strip(" .,¿?¡!\"'")
+    topic = re.sub(r"\s*\b(en|de) youtube\b.*$", "", topic, flags=re.IGNORECASE)
+    topic = re.sub(r"^(un |unos )?videos? (de |del |sobre )", "", topic, flags=re.IGNORECASE)
+    return topic[:80].strip()
+
+
+def understand_turn(session: dict, words: list[str], heard: str) -> dict:
+    phase = session["phase"]
+    videos = session.get("videos") or []
+    ruled = rule_intent(phase, words, heard, videos)
+    if ruled:
+        print(f"rules {heard!r} -> {ruled}", flush=True)
+        return ruled
+    started = time.monotonic()
+    guessed = understand(phase, heard, session.get("asked") or "", videos, session.get("query") or "")
+    took = time.monotonic() - started
+    if guessed and guessed["accion"] == "elegir" and not 1 <= guessed["numero"] <= len(videos):
+        guessed = None
+    if guessed and guessed["accion"] == "buscar":
+        guessed["tema"] = clean_topic(guessed["tema"])
+        # An empty topic in the list would throw the list away.
+        if phase in ("topic", "confirm", "choice") and not guessed["tema"]:
+            guessed = None
+    if guessed and guessed["accion"] == "no" and not only_commands(words):
+        # "no, mejor de Benny Moré": the small model hears the no and drops the topic.
+        guessed = None
+    if guessed and guessed["accion"] != "no_entendi":
+        print(f"ollama {heard!r} -> {guessed} in {took:.1f}s", flush=True)
+        return guessed
+    fallback = fallback_intent(phase, words, heard, videos)
+    print(f"fallback {heard!r} -> {fallback} (ollama said {guessed}, {took:.1f}s)", flush=True)
+    return fallback
+
+
+def reset(session: dict, phase: str = "topic") -> None:
+    session["phase"] = phase
+    session["videos"] = []
+    session["query"] = ""
+
+
+def turn(session_id: str, text: str, client_phase: str = "") -> dict:
+    session = sessions.setdefault(session_id, {"phase": "menu", "videos": [], "query": "", "asked": MENU})
+    if client_phase == "menu":
+        reset(session, "menu")
+        session["asked"] = MENU
+    result = answer(session, (text or "").strip())
+    session["asked"] = result["say"]
+    return result
+
+
+def answer(session: dict, heard: str) -> dict:
+    words = tokens_of(heard)
+    if not words:
+        if session["phase"] == "choice":
+            return {"say": "No te escuché. " + ask_phrase(len(session["videos"])), "phase": "choice", "videos": session["videos"]}
+        return {"say": "No te escuché. Pulsa el botón e inténtalo otra vez.", "phase": "topic"}
+
     # "para" is also a normal Spanish word ("algo para escuchar"), so it only
     # cancels when the request is just that command. In the menu a bare "para"
     # means option two, stop the video.
-    cancel = bool(words) and (
-        words[0] in (CANCEL - {"para"})
-        or (words[0] == "para" and len(words) <= 2 and session["phase"] != "menu")
-    )
-    if cancel:
-        session["phase"] = "topic"
-        session["videos"] = []
-        session["query"] = ""
+    if words[0] in (CANCEL - {"para"}) or (words[0] == "para" and len(words) <= 2 and session["phase"] != "menu"):
+        reset(session)
         return {"say": "Cancelado. Pulsa el botón cuando quieras.", "phase": "topic"}
 
-    if session["phase"] == "menu":
-        picked = menu_choice(words, tokens)
-        if picked == 1:
-            topic = menu_topic(heard)
-            if topic:
-                return ask_to_search(session, heard, topic)
-            session["phase"] = "topic"
-            return {"say": "¿Qué quieres ver?", "phase": "ask"}
-        if picked == 4:
-            return use_saved_list(session, heard)
-        if picked in (2, 3):
-            action = "pause" if picked == 2 else "play"
-            try:
-                control_playback(action)
-            except TvOff:
-                return {
-                    "say": "No encuentro la tele. Enciéndela y pulsa el botón otra vez.",
-                    "phase": "topic",
-                }
-            session["phase"] = "topic"
-            said = "Detuve el video." if picked == 2 else "Sigue el video."
-            return {"say": f"Listo. {said} Pulsa el botón cuando quieras.", "phase": "done"}
-        return {"say": MENU, "phase": "menu"}
+    phase = session["phase"]
+    if phase == "choice" and not session.get("videos"):
+        reset(session)
+        return {"say": "Pulsa el botón y dime qué quieres ver.", "phase": "topic"}
 
-    if session["phase"] == "confirm":
-        kind = answer_kind(words)
+    meant = understand_turn(session, words, heard)
+    action, topic, number = meant["accion"], meant["tema"], meant["numero"]
+
+    if action == "cancelar":
+        reset(session)
+        return {"say": "Cancelado. Pulsa el botón cuando quieras.", "phase": "topic"}
+    if action == "buscar":
+        if topic:
+            return ask_to_search(session, heard, topic)
+        reset(session)
+        return {"say": "¿Qué quieres ver?", "phase": "ask"}
+    if action in ("detener", "reproducir"):
+        return playback(session, action)
+    if action == "lista_guardada":
+        return use_saved_list(session, heard)
+
+    if phase == "confirm":
         query = session.get("query") or ""
-        if kind == "yes" and query:
-            print(f"confirmed {query!r}", flush=True)
-            videos = search_youtube(query)
-            if not videos:
-                session["phase"] = "topic"
-                session["query"] = ""
-                return {"say": "No encontré videos. Pulsa el botón para intentar otro tema.", "phase": "topic"}
-            session["phase"] = "choice"
-            session["videos"] = videos
-            session["query"] = ""
-            save_search(query, videos)
-            return {"say": list_phrase(videos), "phase": "choice", "videos": videos}
-        if kind == "no":
-            session["phase"] = "topic"
-            session["query"] = ""
+        if action == "si" and query:
+            return run_search(session, query)
+        if action == "no":
+            reset(session)
             return {"say": "¿Qué quieres ver?", "phase": "ask"}
-        return {
-            "say": f"¿Busco {query}? Di sí o no." if query else "Di sí o no.",
-            "phase": "confirm",
-        }
+        return {"say": f"¿Busco {query}? Di sí o no." if query else "Di sí o no.", "phase": "confirm"}
 
-    if session["phase"] == "choice" and (tokens & REPEAT or "otravez" in lowered.replace(" ", "") or "denuevo" in lowered.replace(" ", "")):
-        videos = session.get("videos") or []
-        if not videos:
-            session["phase"] = "topic"
-            return {"say": "Pulsa el botón y dime qué quieres ver.", "phase": "topic"}
-        return {"say": list_phrase(videos), "phase": "choice", "videos": videos}
+    if phase == "choice":
+        videos = session["videos"]
+        if action == "repetir":
+            return {"say": list_phrase(videos), "phase": "choice", "videos": videos}
+        if action == "elegir" and 1 <= number <= len(videos):
+            return play_picked(session, videos[number - 1])
+        return {"say": "No entendí. " + ask_phrase(len(videos)), "phase": "choice", "videos": videos}
 
-    if session["phase"] == "choice":
-        videos = session.get("videos") or []
-        if not videos:
-            session["phase"] = "topic"
-            return {"say": "Pulsa el botón y dime qué quieres ver.", "phase": "topic"}
-        return choose_video(session, heard, videos)
+    if phase == "menu":
+        return {"say": "No entendí. " + MENU, "phase": "menu"}
+    return {"say": "No entendí. ¿Qué quieres ver?", "phase": "ask"}
 
-    if not heard:
-        return {"say": "No te escuché. Pulsa el botón e inténtalo otra vez.", "phase": "topic"}
 
-    return ask_to_search(session, heard, search_term(heard))
+def playback(session: dict, action: str) -> dict:
+    try:
+        control_playback("pause" if action == "detener" else "play")
+    except TvOff:
+        return {"say": "No encuentro la tele. Enciéndela y pulsa el botón otra vez.", "phase": "topic"}
+    reset(session)
+    said = "Detuve el video." if action == "detener" else "Sigue el video."
+    return {"say": f"Listo. {said} Pulsa el botón cuando quieras.", "phase": "done"}
+
+
+def run_search(session: dict, query: str) -> dict:
+    print(f"confirmed {query!r}", flush=True)
+    videos = search_youtube(query)
+    if not videos:
+        reset(session)
+        return {"say": "No encontré videos. Pulsa el botón para intentar otro tema.", "phase": "topic"}
+    session["phase"] = "choice"
+    session["videos"] = videos
+    session["query"] = ""
+    save_search(query, videos)
+    return {"say": list_phrase(videos), "phase": "choice", "videos": videos}
 
 
 def menu_topic(heard: str) -> str:
@@ -516,6 +643,7 @@ def ask_to_search(session: dict, heard: str, query: str) -> dict:
     print(f"search {heard!r} -> {query!r}", flush=True)
     session["phase"] = "confirm"
     session["query"] = query
+    session["videos"] = []
     return {"say": f"¿Busco {query}?", "phase": "confirm"}
 
 
@@ -562,7 +690,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, body, "application/json; charset=utf-8")
 
 
+def warm_up() -> None:
+    """Load the model now, so the first question does not wait for it."""
+    understand("menu", "hola", MENU)
+
+
 def main() -> None:
+    threading.Thread(target=warm_up, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
     print(f"roukito-voz http://{HOST}:{PORT}", flush=True)
