@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-"""Spanish voice helper: search YouTube, then play a pick on the Roku via Roukito."""
+"""Spanish voice helper for the Android app: search YouTube, then play a pick on the Roku via Roukito."""
 
 import json
+import os
 import re
 import socket
-import ssl
 import subprocess
-import threading
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-STATIC = ROOT / "static"
+DATA = Path(os.environ.get("ROUKITO_VOZ_DATA", ROOT))
+LAST_SEARCH = DATA / "last_search.json"
 ROUKITO_URL = "http://127.0.0.1:8787/mcp"
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-OLLAMA_MODEL = "qwen2.5:1.5b"
 YT_DLP = ROOT / ".venv" / "bin" / "yt-dlp"
 if not YT_DLP.exists():
     YT_DLP = Path("yt-dlp")
@@ -55,6 +53,18 @@ CANCEL = {"cancela", "cancelar", "nada", "para", "parar", "salir"}
 YES = {"si", "sí", "yes", "claro", "bueno", "ok", "okay", "dale", "busca", "buscar", "correcto", "exacto", "bien", "adelante"}
 NO = {"no", "nel", "nop", "cambiar", "cambia", "otro", "otra"}
 REPEAT = {"repite", "repetir", "otra", "otravez", "denuevo"}
+FILLER = {
+    "quiero", "queria", "quería", "ver", "video", "videos", "por", "favor",
+    "porfavor", "ponme", "pon", "pone", "busca", "buscar", "el", "la", "los", "las",
+    "un", "una", "me", "mi", "mis", "porfa", "porfis", "anda", "reproducir",
+    "poner", "de", "del", "al", "a", "y", "en", "que", "qué", "lo", "le", "les",
+    "te", "se", "con", "para", "oye", "oiga", "hola", "gracias", "quieres",
+    "puedes", "puede", "please",
+}
+LIST_WORDS = {"lista", "ultima", "último", "última", "anterior", "guardada", "guardado"}
+LIST_COMMAND = FILLER | LIST_WORDS | {
+    "elegir", "elige", "busqueda", "búsqueda", "numero", "número",
+}
 
 
 def speakable_title(title: str) -> str:
@@ -156,17 +166,19 @@ def choice_number(text: str) -> int | None:
     return None
 
 
-MENU = "¿Qué quieres hacer? Uno, buscar un video. Dos, detener el video. Tres, reproducir el video."
+MENU = "¿Qué quieres hacer? Uno, buscar un video. Dos, detener el video. Tres, reproducir el video. Cuatro, elegir de la última búsqueda."
 STOP_WORDS = {"detener", "deten", "pausa", "pausar", "stop"}
 PLAY_WORDS = {"reproducir", "reproduce", "play", "continuar", "continua", "sigue", "seguir"}
 SEARCH_WORDS = {"buscar", "busca", "ver"}
 
 
 def menu_choice(words: list[str], tokens: set[str]) -> int | None:
+    if mentions_saved_list(words, tokens):
+        return 4
     number = choice_number(" ".join(words))
     if number in (1, 2, 3):
         return number
-    if words and words[0] == "para" and len(words) > 2:
+    if words and words[0] == "para":
         return 2
     if tokens & STOP_WORDS:
         return 2
@@ -225,47 +237,126 @@ class TvOff(Exception):
     pass
 
 
+def tokens_of(text: str) -> list[str]:
+    return re.sub(r"[^a-záéíóúüñ0-9 ]", " ", text.lower()).split()
+
+
+def fold_word(word: str) -> str:
+    return word.translate(str.maketrans("áéíóúüñ", "aeiouun"))
+
+
+def near(left: str, right: str) -> bool:
+    left, right = fold_word(left), fold_word(right)
+    if left == right:
+        return True
+    if len(left) >= 4 and len(right) >= 4 and (left in right or right in left):
+        return True
+    if min(len(left), len(right)) < 4 or abs(len(left) - len(right)) > 2:
+        return False
+    previous = list(range(len(right) + 1))
+    for index, char in enumerate(left, 1):
+        current = [index]
+        for other_index, other in enumerate(right, 1):
+            current.append(min(
+                current[-1] + 1,
+                previous[other_index] + 1,
+                previous[other_index - 1] + (char != other),
+            ))
+        previous = current
+    return previous[-1] <= 2
+
+
+def content_words(text: str) -> list[str]:
+    return [word for word in tokens_of(text) if word not in FILLER and (len(word) > 2 or word.isdigit())]
+
+
 def search_term(heard: str) -> str:
-    """Turn a spoken sentence into a short YouTube query. Keep the sentence if the model fails."""
-    prompt = (
-        "Convierte lo que dice una persona en una búsqueda corta de YouTube, en español. "
-        "Responde solo con la búsqueda, en una línea, sin comillas ni explicación.\n"
-        "Persona: quiero ver cómo hacer chilaquiles por favor\n"
-        "Búsqueda: cómo hacer chilaquiles\n"
-        "Persona: ponme un video de Juan Gabriel\n"
-        "Búsqueda: Juan Gabriel\n"
-        f"Persona: {heard}\n"
-        "Búsqueda:"
-    )
-    body = json.dumps(
-        {
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "keep_alive": "30m",
-            "options": {"temperature": 0, "num_predict": 24},
-        }
-    ).encode()
-    request = urllib.request.Request(
-        OLLAMA_URL,
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
+    """Keep the topic words and drop Spanish filler."""
+    raw = re.sub(r"[^0-9A-Za-zÁÉÍÓÚÜÑáéíóúüñ ]", " ", heard)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    kept = []
+    for word in raw.split():
+        token = word.lower()
+        if token in FILLER or (len(token) <= 2 and not token.isdigit()):
+            continue
+        kept.append(word)
+    if not kept:
+        return re.sub(r"\s+", " ", heard).strip()
+    return " ".join(kept)
+
+
+def pick_by_title(heard: str, videos: list[dict]) -> int:
+    ignored = folded_tokens(LIST_COMMAND) | folded_tokens(ONES)
+    wanted = [word for word in content_words(heard) if fold_word(word) not in ignored]
+    if not wanted:
+        return 0
+    best_index = 0
+    best_score = 0
+    for index, video in enumerate(videos, start=1):
+        haystack = tokens_of(f"{video.get('title') or ''} {video.get('channel') or ''}")
+        score = sum(1 for word in wanted if any(near(word, other) for other in haystack))
+        if score > best_score:
+            best_score = score
+            best_index = index
+    return best_index if best_score else 0
+
+
+def resolve_choice(heard: str, videos: list[dict]) -> int:
+    number = choice_number(heard)
+    if number is not None:
+        return number if 1 <= number <= len(videos) else 0
+    return pick_by_title(heard, videos)
+
+
+def save_search(query: str, videos: list[dict]) -> None:
+    # Saving is a convenience for option four; a failure must not lose the results.
     try:
-        with urllib.request.urlopen(request, timeout=12) as response:
-            payload = json.loads(response.read().decode())
-    except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError, OSError) as error:
-        print(f"search term fallback: {error}", flush=True)
-        return heard
-    line = str(payload.get("response") or "").strip().splitlines()
-    term = line[0].strip() if line else ""
-    term = re.sub(r"^[\"'`]+|[\"'`]+$", "", term)
-    term = re.sub(r"^(búsqueda|busqueda)\s*:\s*", "", term, flags=re.IGNORECASE)
-    term = re.sub(r"\s+", " ", term).strip(" .")
-    if not term or len(term) > 80 or term.lower().startswith(("claro", "por supuesto", "aquí", "aqui")):
-        print(f"search term rejected: {term!r}", flush=True)
-        return heard
-    return term
+        LAST_SEARCH.write_text(
+            json.dumps({"query": query, "videos": videos}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as error:
+        print(f"could not save {LAST_SEARCH}: {error}", flush=True)
+
+
+def load_search() -> dict | None:
+    try:
+        data = json.loads(LAST_SEARCH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    videos = data.get("videos") or []
+    if not videos:
+        return None
+    return {"query": data.get("query") or "", "videos": videos}
+
+
+def folded_tokens(words: list[str] | set[str]) -> set[str]:
+    return {fold_word(word) for word in words}
+
+
+def mentions_saved_list(words: list[str], tokens: set[str]) -> bool:
+    if choice_number(" ".join(words)) == 4:
+        return True
+    if folded_tokens(tokens) & folded_tokens(LIST_WORDS):
+        return True
+    compact = "".join(fold_word(word) for word in words)
+    return "delalista" in compact or "ultimabusqueda" in compact
+
+
+def utterance_picks_saved(heard: str) -> bool:
+    words = tokens_of(heard)
+    if not words:
+        return False
+    number = choice_number(heard)
+    command = folded_tokens(LIST_COMMAND) | folded_tokens(ONES)
+    content = [word for word in words if fold_word(word) not in command]
+    if content:
+        return True
+    if number is None:
+        return False
+    if number == 4 and not (folded_tokens(words) & folded_tokens(LIST_WORDS)):
+        return False
+    return 1 <= number <= MAX_RESULTS
 
 
 def answer_kind(words: list[str]) -> str:
@@ -274,6 +365,49 @@ def answer_kind(words: list[str]) -> str:
     if set(words) & YES:
         return "yes"
     return ""
+
+
+def play_picked(session: dict, video: dict) -> dict:
+    try:
+        play_on_roku(video["id"])
+    except TvOff:
+        return {
+            "say": "No encuentro la tele. Enciéndela y pulsa el botón otra vez.",
+            "phase": "topic",
+        }
+    session["phase"] = "topic"
+    session["videos"] = []
+    return {
+        "say": "Listo. Ya está en la tele. Pulsa el botón para otro video.",
+        "phase": "done",
+        "video": video,
+    }
+
+
+def choose_video(session: dict, heard: str, videos: list[dict]) -> dict:
+    number = resolve_choice(heard, videos)
+    if number < 1 or number > len(videos):
+        return {
+            "say": "No entendí. " + ask_phrase(len(videos) or 1),
+            "phase": "choice",
+            "videos": videos,
+        }
+    return play_picked(session, videos[number - 1])
+
+
+def use_saved_list(session: dict, heard: str) -> dict:
+    saved = load_search()
+    if not saved:
+        return {
+            "say": "No hay una búsqueda guardada. " + MENU,
+            "phase": "menu",
+        }
+    videos = saved["videos"]
+    session["phase"] = "choice"
+    session["videos"] = videos
+    if utterance_picks_saved(heard):
+        return choose_video(session, heard, videos)
+    return {"say": list_phrase(videos), "phase": "choice", "videos": videos}
 
 
 def turn(session_id: str, text: str, client_phase: str = "") -> dict:
@@ -288,9 +422,11 @@ def turn(session_id: str, text: str, client_phase: str = "") -> dict:
 
     words = lowered.split()
     # "para" is also a normal Spanish word ("algo para escuchar"), so it only
-    # cancels when the request is just that command.
+    # cancels when the request is just that command. In the menu a bare "para"
+    # means option two, stop the video.
     cancel = bool(words) and (
-        words[0] in (CANCEL - {"para"}) or (words[0] == "para" and len(words) <= 2)
+        words[0] in (CANCEL - {"para"})
+        or (words[0] == "para" and len(words) <= 2 and session["phase"] != "menu")
     )
     if cancel:
         session["phase"] = "topic"
@@ -301,8 +437,13 @@ def turn(session_id: str, text: str, client_phase: str = "") -> dict:
     if session["phase"] == "menu":
         picked = menu_choice(words, tokens)
         if picked == 1:
+            topic = menu_topic(heard)
+            if topic:
+                return ask_to_search(session, heard, topic)
             session["phase"] = "topic"
             return {"say": "¿Qué quieres ver?", "phase": "ask"}
+        if picked == 4:
+            return use_saved_list(session, heard)
         if picked in (2, 3):
             action = "pause" if picked == 2 else "play"
             try:
@@ -330,6 +471,7 @@ def turn(session_id: str, text: str, client_phase: str = "") -> dict:
             session["phase"] = "choice"
             session["videos"] = videos
             session["query"] = ""
+            save_search(query, videos)
             return {"say": list_phrase(videos), "phase": "choice", "videos": videos}
         if kind == "no":
             session["phase"] = "topic"
@@ -348,34 +490,29 @@ def turn(session_id: str, text: str, client_phase: str = "") -> dict:
         return {"say": list_phrase(videos), "phase": "choice", "videos": videos}
 
     if session["phase"] == "choice":
-        number = choice_number(heard)
         videos = session.get("videos") or []
-        if number is None or number > len(videos):
-            return {
-                "say": "No entendí. " + ask_phrase(len(videos) or 1),
-                "phase": "choice",
-                "videos": videos,
-            }
-        video = videos[number - 1]
-        try:
-            play_on_roku(video["id"])
-        except TvOff:
-            return {
-                "say": "No encuentro la tele. Enciéndela y pulsa el botón otra vez.",
-                "phase": "topic",
-            }
-        session["phase"] = "topic"
-        session["videos"] = []
-        return {
-            "say": "Listo. Ya está en la tele. Pulsa el botón para otro video.",
-            "phase": "done",
-            "video": video,
-        }
+        if not videos:
+            session["phase"] = "topic"
+            return {"say": "Pulsa el botón y dime qué quieres ver.", "phase": "topic"}
+        return choose_video(session, heard, videos)
 
     if not heard:
         return {"say": "No te escuché. Pulsa el botón e inténtalo otra vez.", "phase": "topic"}
 
-    query = search_term(heard)
+    return ask_to_search(session, heard, search_term(heard))
+
+
+def menu_topic(heard: str) -> str:
+    """The topic in "buscar videos de gatos", so the menu need not ask again."""
+    words = tokens_of(heard)
+    if words and words[0] in ONES:
+        heard = re.sub(r"^\W*\w+", "", heard, count=1)
+    if not [word for word in content_words(heard) if word not in SEARCH_WORDS]:
+        return ""
+    return search_term(heard)
+
+
+def ask_to_search(session: dict, heard: str, query: str) -> dict:
     print(f"search {heard!r} -> {query!r}", flush=True)
     session["phase"] = "confirm"
     session["query"] = query
@@ -383,6 +520,9 @@ def turn(session_id: str, text: str, client_phase: str = "") -> dict:
 
 
 class Handler(BaseHTTPRequestHandler):
+    # A phone that drops off the Wi-Fi mid-request must not hold a thread forever.
+    timeout = 30
+
     def log_message(self, fmt: str, *args) -> None:
         print(f"{self.address_string()} {fmt % args}")
 
@@ -395,23 +535,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        if not isinstance(self.connection, ssl.SSLSocket):
-            host = self.headers.get("Host", f"192.168.68.100:{PORT}").split(":")[0]
-            target = f"https://{host}:{PORT}{self.path}"
-            body = f"Abre {target}\n".encode()
-            self.send_response(302)
-            self.send_header("Location", target)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        path = self.path.split("?", 1)[0]
-        if path in ("/", "/index.html"):
-            page = (STATIC / "index.html").read_bytes()
-            self._send(200, page, "text/html; charset=utf-8")
-            return
-        if path == "/health":
+        if self.path.split("?", 1)[0] == "/health":
             self._send(200, b"ok\n", "text/plain; charset=utf-8")
             return
         self._send(404, b"no\n", "text/plain; charset=utf-8")
@@ -438,37 +562,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, body, "application/json; charset=utf-8")
 
 
-class VoiceServer(ThreadingHTTPServer):
-    def __init__(self, address, handler, context: ssl.SSLContext) -> None:
-        self.ssl_context = context
-        super().__init__(address, handler)
-
-    def process_request(self, request, client_address) -> None:
-        thread = threading.Thread(
-            target=self._handle_client,
-            args=(request, client_address),
-            daemon=True,
-        )
-        thread.start()
-
-    def _handle_client(self, request, client_address) -> None:
-        try:
-            request.settimeout(12)
-            first = request.recv(1, socket.MSG_PEEK)
-            if first[:1] == b"\x16":
-                request = self.ssl_context.wrap_socket(request, server_side=True)
-            self.finish_request(request, client_address)
-        except Exception as error:
-            print(f"{client_address[0]} closed: {error}")
-        finally:
-            self.shutdown_request(request)
-
-
 def main() -> None:
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.load_cert_chain(ROOT / "cert.pem", ROOT / "key.pem")
-    server = VoiceServer((HOST, PORT), Handler, context)
-    print(f"roukito-voz http://{HOST}:{PORT} and https://{HOST}:{PORT}", flush=True)
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server.daemon_threads = True
+    print(f"roukito-voz http://{HOST}:{PORT}", flush=True)
     server.serve_forever()
 
 

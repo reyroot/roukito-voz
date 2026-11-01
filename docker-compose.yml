@@ -1,0 +1,10 @@
+services:
+  roukito-voz:
+    build: .
+    container_name: roukito-voz
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      ROUKITO_VOZ_DATA: /data
+    volumes:
+      - ./data:/data

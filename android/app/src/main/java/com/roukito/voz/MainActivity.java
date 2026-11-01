@@ -6,10 +6,13 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.media.AudioManager;
 import android.media.ToneGenerator;
+import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityManager;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
@@ -33,7 +36,7 @@ import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
     private static final String API = "http://192.168.68.100:8790/api/turn";
-    private static final String MENU = "¿Qué quieres hacer? Uno, buscar un video. Dos, detener el video. Tres, reproducir el video.";
+    private static final String MENU = "¿Qué quieres hacer? Uno, buscar un video. Dos, detener el video. Tres, reproducir el video. Cuatro, elegir de la última búsqueda.";
     private static final int MIC = 1;
 
     private final String session = UUID.randomUUID().toString();
@@ -223,6 +226,12 @@ public class MainActivity extends Activity {
                     once(() -> speak("Hace falta el micrófono.", MainActivity.this::setIdle));
                     return;
                 }
+                if (isTalkBackActive() && attempt < 4 && (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+                        || error == SpeechRecognizer.ERROR_CLIENT
+                        || error == SpeechRecognizer.ERROR_AUDIO)) {
+                    once(() -> main.postDelayed(() -> startListen(onText, attempt + 1), 800));
+                    return;
+                }
                 if (!ready && attempt < 6) {
                     once(() -> main.postDelayed(() -> startListen(onText, attempt + 1), 1000));
                     return;
@@ -269,8 +278,9 @@ public class MainActivity extends Activity {
         }
         int generation = ++speakGeneration;
         if (isTalkBackActive()) {
-            talk.announceForAccessibility(text);
-            waitUntilTalkBackQuiet(generation, text.length(), after);
+            int baseline = playbackCount();
+            announceForTalkBack(text);
+            waitUntilTalkBackQuiet(generation, text.length(), baseline, after);
             return;
         }
         String utteranceId = UUID.randomUUID().toString();
@@ -362,6 +372,7 @@ public class MainActivity extends Activity {
     }
 
     private void setIdle() {
+        talk.setContentDescription(getString(R.string.talk));
         setBusy(false);
     }
 
@@ -370,13 +381,40 @@ public class MainActivity extends Activity {
         if (lowered.matches(".*\\bno\\b.*")) {
             return false;
         }
-        return lowered.matches(".*\\b(sí|si|claro|bueno|ok|dale|bien|busca|buscar)\\b.*");
+        // Keep in step with YES in server.py, or a yes gets no "Buscando videos".
+        return lowered.matches(".*\\b(sí|si|yes|claro|bueno|ok|okay|dale|bien|busca|buscar|correcto|exacto|adelante)\\b.*");
     }
 
-    private void waitUntilTalkBackQuiet(int generation, int characters, Runnable after) {
+    private void announceForTalkBack(String text) {
+        talk.setContentDescription(text);
+        AccessibilityManager manager = (AccessibilityManager) getSystemService(ACCESSIBILITY_SERVICE);
+        if (manager != null && manager.isEnabled()) {
+            AccessibilityEvent event = Build.VERSION.SDK_INT >= 30
+                    ? new AccessibilityEvent(AccessibilityEvent.TYPE_ANNOUNCEMENT)
+                    : AccessibilityEvent.obtain(AccessibilityEvent.TYPE_ANNOUNCEMENT);
+            event.setClassName(getClass().getName());
+            event.setPackageName(getPackageName());
+            event.getText().add(text);
+            event.setContentDescription(text);
+            manager.sendAccessibilityEvent(event);
+        }
+        talk.announceForAccessibility(text);
+    }
+
+    private int playbackCount() {
+        AudioManager audio = (AudioManager) getSystemService(AUDIO_SERVICE);
+        if (audio == null) {
+            return 0;
+        }
+        return audio.getActivePlaybackConfigurations().size();
+    }
+
+    private void waitUntilTalkBackQuiet(int generation, int characters, int baseline, Runnable after) {
         AudioManager audio = (AudioManager) getSystemService(AUDIO_SERVICE);
         long started = android.os.SystemClock.elapsedRealtime();
-        long fallback = Math.max(1600, characters * 55L);
+        // Phones that hide TalkBack audio used to open the mic after 55ms per
+        // character, while a slower TalkBack voice was still speaking.
+        long estimate = Math.max(2800L, characters * 140L);
         Runnable check = new Runnable() {
             private boolean heard;
 
@@ -385,7 +423,8 @@ public class MainActivity extends Activity {
                 if (generation != speakGeneration) {
                     return;
                 }
-                boolean playing = audio != null && !audio.getActivePlaybackConfigurations().isEmpty();
+                int now = audio == null ? 0 : audio.getActivePlaybackConfigurations().size();
+                boolean playing = now > baseline;
                 if (playing) {
                     heard = true;
                 }
@@ -395,10 +434,10 @@ public class MainActivity extends Activity {
                         if (generation == speakGeneration) {
                             after.run();
                         }
-                    }, 400);
+                    }, 800);
                     return;
                 }
-                if ((!heard && elapsed >= fallback) || elapsed > fallback + 8000) {
+                if ((!heard && elapsed >= estimate) || elapsed > estimate + 4000) {
                     if (generation == speakGeneration) {
                         after.run();
                     }
@@ -407,7 +446,7 @@ public class MainActivity extends Activity {
                 main.postDelayed(this, 200);
             }
         };
-        main.postDelayed(check, 250);
+        main.postDelayed(check, 300);
     }
 
     private void startWaitingSound() {
@@ -453,12 +492,20 @@ public class MainActivity extends Activity {
     }
 
     private boolean isTalkBackActive() {
+        AccessibilityManager manager = (AccessibilityManager) getSystemService(ACCESSIBILITY_SERVICE);
+        if (manager != null && manager.isEnabled() && manager.isTouchExplorationEnabled()) {
+            return true;
+        }
         if (Settings.Secure.getInt(getContentResolver(), Settings.Secure.ACCESSIBILITY_ENABLED, 0) != 1) {
             return false;
         }
         String enabled = Settings.Secure.getString(
                 getContentResolver(), Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
-        return enabled != null && enabled.toLowerCase(Locale.ROOT).contains("talkback");
+        if (enabled == null) {
+            return false;
+        }
+        String lowered = enabled.toLowerCase(Locale.ROOT);
+        return lowered.contains("talkback") || lowered.contains("marvin");
     }
 
     private void setStatus(String text) {

@@ -1,0 +1,9 @@
+.git
+.venv
+android
+__pycache__
+*.apk
+cert.pem
+key.pem
+data
+last_search.json

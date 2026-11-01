@@ -7,21 +7,21 @@ He hears “¿Qué quieres hacer?” and then:
 1. Buscar un video. The phone confirms the search term, reads up to five YouTube results, and he picks one by number. The Roku plays that video.
 2. Detener el video.
 3. Reproducir el video.
+4. Elegir de la última búsqueda. The phone reads the saved results again, or plays the one he names.
 
 The phone beeps when the microphone is ready. With TalkBack on, the prompts go through TalkBack. With TalkBack off, the app speaks itself.
 
 ## Run the server
 
-On the same machine as Roukito and Ollama:
+On the same machine as Roukito. The container uses the host network so it can reach Roukito on `127.0.0.1`.
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install yt-dlp
-openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 825 -nodes -subj "/CN=roukito-voz"
-.venv/bin/python server.py
+docker compose up -d --build
 ```
 
-Roukito must be listening at `http://127.0.0.1:8787/mcp`. Ollama must be listening at `http://127.0.0.1:11434` with `qwen2.5:1.5b`, which turns a spoken sentence into a short YouTube search.
+The last search is saved in `data/` next to the compose file.
+
+Roukito must be listening at `http://127.0.0.1:8787/mcp`. A spoken sentence becomes a YouTube search by dropping filler words such as “quiero ver” and “por favor”.
 
 The phone calls `http://<server>:8790/api/turn`. Set that address in `MainActivity` before building the app. The phone and the server must be on the same Wi-Fi.
 
