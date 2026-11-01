@@ -153,8 +153,13 @@ public class MainActivity extends Activity {
                     deliver.run();
                 });
             } catch (Exception error) {
+                // A phone on the guest Wi-Fi reaches the internet but not the
+                // server, and used to hear only "Hubo un problema".
+                boolean unreachable = error instanceof java.io.IOException;
                 runOnUiThread(() -> {
-                    failure[0] = "Hubo un problema. Pulsa el botón e inténtalo otra vez.";
+                    failure[0] = unreachable
+                            ? "No llego al servidor de la casa. Conecta el teléfono al wifi de la casa, no al de invitados, y pulsa el botón otra vez."
+                            : "Hubo un problema. Pulsa el botón e inténtalo otra vez.";
                     deliver.run();
                 });
             }
